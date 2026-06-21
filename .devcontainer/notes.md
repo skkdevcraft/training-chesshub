@@ -1,3 +1,3 @@
 ```bash
-docker exec -it -u node friendly_almeida bash
+docker exec -it -u node tender_roentgen bash
 ```

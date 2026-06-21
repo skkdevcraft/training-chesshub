@@ -7,7 +7,13 @@
 	"runArgs": [
 		"--device", "/dev/fuse", 
 		"--cap-add", "SYS_ADMIN"
-	]
+	],
+	"features": {
+		"ghcr.io/devcontainers/features/github-cli:1": {
+			"installDirectlyFromGitHubRelease": true,
+			"version": "latest"
+		}
+	}
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
