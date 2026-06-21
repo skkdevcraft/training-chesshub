@@ -1,0 +1,24 @@
+{
+  "name": "training-chesshub",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/skkdevcraft/training-chesshub#readme",
+  "bugs": {
+    "url": "https://github.com/skkdevcraft/training-chesshub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skkdevcraft/training-chesshub.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "pi": "agentignore run pi"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.9",
+    "@xlansoftware/agentignore": "^0.4.3"
+  }
+}
