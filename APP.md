@@ -1,314 +1,1036 @@
-# ChessHub — Application Specification
+# ChessHub — Application Specification (Training Edition)
 
 ## Overview
 
-**ChessHub** is an asynchronous, correspondence-style chess platform where players meet, play, and track their progress. Players make moves at their own pace — from minutes to days apart — and can resume games at any time. The platform includes a lobby for open challenges, direct invites, a friends/follow system, and an Elo-based leaderboard.
-
-## Technology Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Framework | ASP.NET Core MVC (.NET 9) |
-| Language | C# 12 |
-| View engine | Razor (.cshtml) |
-| Database | PostgreSQL (recommended) or MS SQL Server |
-| ORM | Entity Framework Core |
-| Real-time | SignalR |
-| Authentication | ASP.NET Core Identity (local accounts — email + password) |
-| Email (dev) | Mailpit (SMTP sink) |
-| Chess rules | .NET chess library (e.g. Chess.NET) |
-| Board UI | cm-chessboard (vanilla JS) |
-| Interactivity | TypeScript + HTMX + SignalR JS client |
-| Containerization | Docker Compose (DB + Mailpit) |
-
-## Project Structure
-
-```
-ChessHub.sln
-├── ChessHub.Web/          ← MVC app (Controllers, Views, wwwroot, Hubs)
-├── ChessHub.Domain/       ← Entities, enums, value objects
-├── ChessHub.Data/         ← EF Core DbContext, migrations, repositories
-└── ChessHub.Services/     ← Business logic (chess engine, Elo, friends)
-```
-
-Dependency direction: `Web` → `Services` → `Data` → `Domain`.
-
-## Database & Persistence
-
-- **Provider**: PostgreSQL (via Npgsql), with MS SQL Server as a documented alternative.
-- **Approach**: EF Core Code-First with migrations stored in `ChessHub.Data`.
-- **Connection string**: configured via `appsettings.json` / environment variables, pointing to the Docker PostgreSQL container in development.
-
-### Core Entities
-
-```
-User (extends IdentityUser)
-  - EloRating
-  - JoinDate
-  - SendEmailOnMove (bool)
-  - ProfileVisibility (enum: Public, FriendsOnly)
-
-Game
-  - WhitePlayerId, BlackPlayerId
-  - CurrentFEN
-  - Status (enum: WaitingForOpponent, InProgress, WhiteWon, BlackWon, Draw, Aborted)
-  - CreatedAt, LastMoveAt
-  - IsOpenInvite (bool)
-  - DesiredColor (enum: White, Black, Random) — for open invite creator
-  - ExpiresAt (nullable, for open invites)
-
-Move
-  - GameId, MoveNumber
-  - FromSquare, ToSquare
-  - PromotionPiece (nullable)
-  - SAN (Standard Algebraic Notation)
-  - Timestamp
-
-Friendship
-  - UserId, FriendId
-  - CreatedAt
-
-FriendRequest
-  - SenderId, ReceiverId
-  - Status (enum: Pending, Accepted, Rejected)
-  - CreatedAt, ResolvedAt
-
-Follow
-  - FollowerId, FollowedId
-  - CreatedAt
-
-DirectInvite
-  - SenderId, ReceiverId
-  - DesiredColor
-  - Status (enum: Pending, Accepted, Declined, Expired)
-  - CreatedAt, ExpiresAt
-```
-
-## Authentication & Identity
-
-- **ASP.NET Core Identity** with local accounts only (email + password).
-- **Email confirmation required** — uses the default Identity flow. Confirmation link sent via email.
-- Confirmation is enforced before: creating a game, joining a game, or sending friend requests. Browsing the lobby and leaderboard is allowed without confirmation.
-- All protected endpoints use `[Authorize]`.
-- Password reset via email (default Identity flow).
-
-## Game Mechanics
-
-### Time Model
-
-- **Asynchronous only** — no clock, no countdown. Players move whenever they want.
-- A game is never forfeited due to inactivity (no move deadlines in v1).
-- The `LastMoveAt` timestamp is informational and displayed on the game page.
-
-### Game Creation
-
-**Open Invite** (appears in lobby):
-1. Player creates a game, picks desired color (White / Black / Random).
-2. The game appears in the public lobby with status `WaitingForOpponent`.
-3. Any other logged-in, confirmed player can click "Join". The game starts immediately.
-4. The invite expires after **72 hours** if unclaimed, or the creator can cancel it manually.
-
-**Direct Invite** (point-to-point):
-1. Player selects an opponent by username and picks desired color.
-2. A `DirectInvite` is created with status `Pending` and a 24-hour expiration.
-3. The recipient sees the invite as a notification. They can Accept or Decline.
-4. On accept: game is created, both players are notified.
-5. On decline or expiry: sender is notified.
-
-### Move Validation
-
-- Every move is validated server-side by the .NET chess library against the current FEN.
-- Invalid moves are rejected with an error message.
-- The library auto-detects: check, checkmate, stalemate, threefold repetition, 50-move rule, insufficient material.
-
-### Game Endings
-
-| Ending | Trigger | Result |
-|--------|---------|--------|
-| Checkmate | Auto-detected by engine | Winner declared |
-| Stalemate | Auto-detected by engine | Draw |
-| Resignation | Player clicks "Resign" | Opponent wins |
-| Draw offer | Player offers → opponent accepts | Draw |
-| Threefold repetition | Auto-detected by engine | Draw |
-| 50-move rule | Auto-detected by engine | Draw |
-| Insufficient material | Auto-detected by engine | Draw |
-
-**Draw offer mechanics:**
-- A player clicks "Offer Draw" during their turn.
-- The opponent sees the offer. It stands until: the opponent accepts, the opponent makes a move (implicit decline), or the offering player withdraws it.
-
-### Rematch
-
-- After a game ends, both players see a "Rematch" button.
-- Clicking it sends a rematch request to the opponent.
-- If accepted, a new game is created with **colors swapped** (previous White gets Black and vice versa).
-- If declined, players return to whatever page they were on.
-
-### Game State on Resume
-
-- When opening a game, the server loads the current FEN directly (instant board reconstruction).
-- The full move history is loaded separately for display as a scrollable list with SAN notation.
-- The FEN is the materialized state; moves are the source of truth. The FEN can always be rebuilt by replaying moves.
-
-## Real-Time Updates (SignalR)
-
-### Hubs
-
-**GameHub** (`/hubs/game`):
-- Groups: one group per game (`game-{gameId}`).
-- Events pushed:
-  - `MoveMade` — opponent made a move (includes SAN, FEN, move number).
-  - `GameEnded` — game concluded (result, reason).
-  - `DrawOffered` / `DrawOfferWithdrawn` / `DrawAccepted`.
-  - `RematchOffered` / `RematchAccepted` / `RematchDeclined`.
-
-**LobbyHub** (`/hubs/lobby`):
-- Events pushed:
-  - `GameCreated` — new open-invite game appeared.
-  - `GameJoined` — an open-invite game was claimed (removed from lobby).
-  - `GameCanceled` — an open invite was canceled or expired.
-
-### Client Integration
-
-- The SignalR JavaScript client connects on page load (authenticated via the Identity cookie).
-- Incoming events update the chessboard (make opponent's move visible), show toast notifications, and trigger HTMX partial-refreshes for lists (lobby, game history, notifications).
-
-## Lobby
-
-- Accessible at `/lobby` (requires login).
-- Displays all open-invite games with: creator username, creator Elo, desired color, time since created.
-- Real-time updated via SignalR (new games appear, claimed games disappear).
-- Each row has a "Join" button (hidden for games created by the current user).
-- The page also shows a "Create Open Game" button and a "Invite Player" form (username input + color picker).
-
-## Leaderboard
-
-- Accessible at `/leaderboard` (public, no login required).
-- Ranked by **Elo rating** descending.
-- Columns: Rank, Username, Elo, Games Played, Win/Loss/Draw.
-- Default view: top 50. Paginated for more.
-- Optionally filterable by time period (all-time, last 30 days, last 7 days) — nice-to-have for v1.
-
-## Elo Rating System
-
-- Every player starts at **1200 Elo**.
-- After each game (non-draw), Elo is recalculated using the standard formula:
-  - Expected score for player A: `Ea = 1 / (1 + 10^((Rb - Ra) / 400))`
-  - New rating: `Ra' = Ra + K * (Sa - Ea)` where `K = 32` and `Sa` is actual score (1 = win, 0 = loss, 0.5 = draw).
-- Both players' ratings are updated in a single database transaction alongside the game result.
-- Elo history is not tracked in v1 (current rating only).
-
-## Friends & Follows
-
-### Friendship (bidirectional, mutual)
-1. User A sends a friend request to User B.
-2. User B sees the request in their notifications and can Accept or Reject.
-3. On acceptance, a `Friendship` row is created (bidirectional — A↔B).
-4. Either user can unfriend at any time (removes the `Friendship` row).
-
-### Follow (unidirectional)
-1. User A follows User B — no approval needed.
-2. A `Follow` row is created. User B is notified.
-3. User A can unfollow at any time.
-4. Following does not imply friendship and vice versa. They are independent.
-
-## Notifications
-
-### On-Site Badge
-- A bell icon in the navigation bar displays a count of unread notifications.
-- Notification types:
-  - **Your turn** — an opponent moved in one of your games.
-  - **Friend request** — received/sent status change.
-  - **Game invite** — someone invited you to a direct game.
-  - **Game ended** — a game you participated in concluded.
-  - **New follower** — someone followed you.
-- Clicking the bell shows a dropdown list of recent notifications.
-
-### Email Notifications
-- User-configurable toggle: `SendEmailOnMove` (default: true).
-- Email is sent when: it's the user's turn (opponent moved), a game they're in ended, they received a friend request, or they received a direct game invite.
-- Uses ASP.NET's `IEmailSender`. In development, emails are captured by Mailpit and viewable at `http://localhost:8025`.
-
-## User Profile
-
-**Public profile** (`/players/{username}`):
-- Username, join date.
-- Current Elo rating.
-- Win / Loss / Draw record.
-- Total games played.
-- Friends list (visible to all logged-in users).
-- **Game history** — paginated list of completed games. Each row shows: opponent, result, date, and a "Replay" button that navigates to a read-only game view.
-- **Open games** — list of in-progress games (your turn highlighted). Each has a "Resume" button.
-
-**Private settings** (`/account/settings`):
-- Change email / password (default Identity UI).
-- Email notification toggle.
-- Profile visibility (Public vs. Friends-only).
-
-## Spectating
-
-- Any logged-in, confirmed user can navigate to `/games/{id}` and watch an in-progress game.
-- Spectators see: the current board state, whose turn it is, and the move history in SAN notation.
-- Spectators **cannot** interact — no moves, no chat, no draw offers.
-- Board updates in real-time via the GameHub (spectators join the game's SignalR group in read-only mode).
-
-## Local Development Setup
-
-### Prerequisites
-- .NET 9 SDK
-- Docker Desktop (or Podman)
-- Node.js (for TypeScript compilation)
-
-### Quick Start
-```bash
-# 1. Start infrastructure
-docker compose up -d    # PostgreSQL + Mailpit
-
-# 2. Apply migrations
-cd ChessHub.Data
-dotnet ef database update
-
-# 3. Run the app
-cd ChessHub.Web
-dotnet run
-```
-
-- App: `http://localhost:5000`
-- Mailpit UI: `http://localhost:8025` (catch dev emails)
-
-### docker-compose.yml (conceptual)
-Services: `postgres` (port 5432) and `mailpit` (SMTP on 1025, UI on 8025). The app connects to these via `appsettings.Development.json`.
-
-## Pages Map
-
-| Route | Page | Auth Required |
-|-------|------|:---:|
-| `/` | Landing / home page | No |
-| `/account/login` | Login | No |
-| `/account/register` | Registration | No |
-| `/account/settings` | User settings | Yes |
-| `/lobby` | Lobby (open games + invite form) | Yes |
-| `/leaderboard` | Leaderboard | No |
-| `/players/{username}` | Player profile | No* |
-| `/games/{id}` | Game page (play / spectate) | Yes |
-| `/games/{id}/replay` | Replay completed game | Yes |
-| `/friends` | Friends list + pending requests | Yes |
-| `/notifications` | Full notifications page | Yes |
-
-*Public profiles visible to all; friends-only profiles require login and friendship.
-
-## Out of Scope (v1)
-
-- Timed/real-time games
-- In-game chat
-- Engine analysis / computer evaluation
-- Anti-cheating detection
-- Tournament mode
-- Mobile app (responsive web only)
-- OAuth / social login
-- Push notifications
-- Elo history chart
+**ChessHub** is an asynchronous, correspondence-style chess platform where players meet, play, and track their progress. Players make moves at their own pace and can resume games at any time.
+
+The project is intended as an educational ASP.NET Core application demonstrating:
+
+* ASP.NET Core MVC
+* Razor Views
+* ASP.NET Core Identity
+* Entity Framework Core
+* PostgreSQL
+* SignalR
+* Layered Architecture
+* Domain Modeling
+* Authorization
+* Background Services
+* Docker-based local development
+
+The goal is to follow enterprise development practices while remaining achievable for a single developer.
 
 ---
 
-*This specification is a living document. Amend as decisions are made during implementation.*
+# Technology Stack
+
+| Layer                  | Technology                 |
+| ---------------------- | -------------------------- |
+| Framework              | ASP.NET Core MVC (.NET 10) |
+| Language               | C#                         |
+| View Engine            | Razor (.cshtml)            |
+| Database               | PostgreSQL                 |
+| ORM                    | Entity Framework Core      |
+| Authentication         | ASP.NET Core Identity      |
+| Real-time              | SignalR                    |
+| Email                  | Mailpit (development)      |
+| Chess Rules            | .NET chess library         |
+| Board UI               | cm-chessboard              |
+| Frontend Interactivity | HTMX + TypeScript          |
+| Containerization       | Docker Compose             |
+
+---
+
+# Solution Structure
+
+```text
+ChessHub.sln
+
+├── ChessHub.Web
+├── ChessHub.Application
+├── ChessHub.Infrastructure
+├── ChessHub.Domain
+└── ChessHub.Data
+```
+
+## Dependency Direction
+
+```text
+Web
+ ↓
+Application
+ ↓
+Infrastructure
+ ↓
+Data
+ ↓
+Domain
+```
+
+### Domain
+
+Contains:
+
+* Entities
+* Enums
+* Value Objects
+
+No EF Core references.
+
+### Application
+
+Contains:
+
+* Business services
+* Interfaces
+* Domain workflows
+
+Examples:
+
+```text
+GameService
+FriendshipService
+NotificationService
+EloService
+AchievementService
+```
+
+### Infrastructure
+
+Contains:
+
+* Email implementation
+* Chess library adapters
+* External integrations
+
+### Data
+
+Contains:
+
+* DbContext
+* EF Core configuration
+* Migrations
+
+### Web
+
+Contains:
+
+* MVC Controllers
+* Razor Views
+* SignalR Hubs
+* View Models
+
+---
+
+# Database & Persistence
+
+## Provider
+
+PostgreSQL via Npgsql.
+
+## Approach
+
+EF Core Code First.
+
+Migrations stored in `ChessHub.Data`.
+
+---
+
+# Core Entities
+
+## User
+
+Extends IdentityUser.
+
+```text
+EloRating
+JoinDate
+SendEmailOnMove
+CreatedAt
+UpdatedAt
+```
+
+Default Elo:
+
+```text
+1200
+```
+
+---
+
+## UserStatistics
+
+```text
+UserId
+GamesPlayed
+Wins
+Losses
+Draws
+```
+
+---
+
+## Game
+
+```text
+WhitePlayerId
+BlackPlayerId
+
+CurrentFEN
+
+Status
+CreatedAt
+UpdatedAt
+LastMoveAt
+
+IsOpenInvite
+DesiredColor
+ExpiresAt
+
+RowVersion
+```
+
+Status:
+
+```text
+WaitingForOpponent
+InProgress
+WhiteWon
+BlackWon
+Draw
+Aborted
+```
+
+---
+
+## Move
+
+```text
+GameId
+MoveNumber
+
+FromSquare
+ToSquare
+PromotionPiece
+
+SAN
+
+Timestamp
+```
+
+---
+
+## Friendship
+
+```text
+UserId
+FriendId
+CreatedAt
+```
+
+---
+
+## FriendRequest
+
+```text
+SenderId
+ReceiverId
+
+Status
+
+CreatedAt
+ResolvedAt
+```
+
+Status:
+
+```text
+Pending
+Accepted
+Rejected
+```
+
+---
+
+## DirectInvite
+
+```text
+SenderId
+ReceiverId
+
+DesiredColor
+
+Status
+
+CreatedAt
+ExpiresAt
+```
+
+Status:
+
+```text
+Pending
+Accepted
+Declined
+Expired
+```
+
+---
+
+## Notification
+
+```text
+Id
+UserId
+
+Type
+Message
+
+IsRead
+
+CreatedAt
+```
+
+Notification Types:
+
+```text
+YourTurn
+FriendRequest
+GameInvite
+GameEnded
+AchievementUnlocked
+System
+```
+
+---
+
+## Achievement
+
+```text
+Id
+Name
+Description
+```
+
+Example achievements:
+
+```text
+First Victory
+5 Games Played
+10 Games Played
+Reach 1400 Elo
+```
+
+---
+
+# Authentication & Identity
+
+Uses ASP.NET Core Identity.
+
+Authentication method:
+
+```text
+Email + Password
+```
+
+Features:
+
+* Registration
+* Login
+* Logout
+* Email Confirmation
+* Password Reset
+
+Email confirmation required before:
+
+* Creating games
+* Joining games
+* Sending friend requests
+
+---
+
+# Game Mechanics
+
+## Time Model
+
+Asynchronous only.
+
+No clocks.
+
+No time controls.
+
+No automatic losses due to inactivity.
+
+---
+
+## Open Games
+
+### Creation
+
+Player selects:
+
+```text
+White
+Black
+Random
+```
+
+An open game is created.
+
+Status:
+
+```text
+WaitingForOpponent
+```
+
+Visible in the lobby.
+
+---
+
+### Joining
+
+Any confirmed user may join.
+
+The game immediately becomes:
+
+```text
+InProgress
+```
+
+---
+
+### Expiration
+
+Open games expire after:
+
+```text
+72 hours
+```
+
+if unclaimed.
+
+---
+
+## Direct Invites
+
+Player selects:
+
+```text
+Opponent Username
+Desired Color
+```
+
+Invite status:
+
+```text
+Pending
+```
+
+Recipient may:
+
+```text
+Accept
+Decline
+```
+
+Direct invites expire after:
+
+```text
+24 hours
+```
+
+---
+
+## Move Validation
+
+Every move is validated server-side.
+
+The chess library is responsible for:
+
+* Legal move validation
+* Check detection
+* Checkmate detection
+* Stalemate detection
+* Threefold repetition
+* Fifty-move rule
+* Insufficient material
+
+Invalid moves are rejected.
+
+---
+
+## Draw Offers
+
+Player may offer a draw during their turn.
+
+The offer remains active until:
+
+* Accepted
+* Withdrawn
+* Opponent makes a move
+
+---
+
+## Resignation
+
+Player may resign at any time.
+
+Opponent wins immediately.
+
+---
+
+## Rematch
+
+After game completion:
+
+* Either player may offer a rematch.
+* If accepted, a new game is created.
+* Colors are swapped.
+
+---
+
+## Replay
+
+Completed games support replay mode.
+
+Controls:
+
+```text
+First Move
+Previous Move
+Next Move
+Last Move
+Auto Play
+```
+
+Replay is read-only.
+
+---
+
+# Elo Rating
+
+Starting rating:
+
+```text
+1200
+```
+
+Formula:
+
+```text
+Ea = 1 / (1 + 10^((Rb - Ra) / 400))
+
+Ra' = Ra + K * (Sa - Ea)
+
+K = 32
+```
+
+Updated when a game ends.
+
+Draws use:
+
+```text
+Sa = 0.5
+```
+
+---
+
+# Concurrency Requirements
+
+Only one move may be accepted for a turn.
+
+Game updates must be transactional.
+
+Suggested implementation:
+
+```text
+RowVersion
+```
+
+on the Game entity.
+
+If concurrent submissions occur:
+
+* One succeeds
+* One fails gracefully
+
+---
+
+# Real-Time Updates (SignalR)
+
+## GameHub
+
+Route:
+
+```text
+/hubs/game
+```
+
+Group:
+
+```text
+game-{gameId}
+```
+
+Events:
+
+```text
+MoveMade
+GameEnded
+
+DrawOffered
+DrawWithdrawn
+DrawAccepted
+
+RematchOffered
+RematchAccepted
+RematchDeclined
+```
+
+---
+
+## LobbyHub
+
+Route:
+
+```text
+/hubs/lobby
+```
+
+Events:
+
+```text
+GameCreated
+GameJoined
+GameCancelled
+```
+
+---
+
+# Lobby
+
+Route:
+
+```text
+/lobby
+```
+
+Requires authentication.
+
+Displays:
+
+* Open games
+* Creator username
+* Creator Elo
+* Desired color
+* Time since creation
+
+Actions:
+
+* Join Game
+* Create Game
+* Invite Player
+
+Updates in real time.
+
+---
+
+# Leaderboard
+
+Route:
+
+```text
+/leaderboard
+```
+
+Public.
+
+Sorted by Elo descending.
+
+Columns:
+
+```text
+Rank
+Username
+Elo
+Games Played
+Wins
+Losses
+Draws
+```
+
+Default:
+
+```text
+Top 50
+```
+
+Pagination required.
+
+---
+
+# Friends
+
+## Friend Request
+
+User A sends request.
+
+User B may:
+
+```text
+Accept
+Reject
+```
+
+Accepted requests create a Friendship.
+
+---
+
+## Unfriend
+
+Either side may remove friendship.
+
+---
+
+# Notifications
+
+## Navigation Badge
+
+Navbar bell icon.
+
+Displays unread count.
+
+---
+
+## Notification Types
+
+```text
+Your Turn
+Friend Request
+Game Invite
+Game Ended
+Achievement Unlocked
+```
+
+---
+
+## Notification Page
+
+Route:
+
+```text
+/notifications
+```
+
+Features:
+
+* View notifications
+* Mark as read
+* Mark all as read
+
+---
+
+## Email Notifications
+
+Only one email type:
+
+```text
+Your Turn
+```
+
+Controlled by:
+
+```text
+SendEmailOnMove
+```
+
+Uses:
+
+```text
+IEmailSender
+```
+
+Development email delivery:
+
+```text
+Mailpit
+```
+
+---
+
+# User Profiles
+
+Route:
+
+```text
+/players/{username}
+```
+
+Public.
+
+Displays:
+
+* Username
+* Join Date
+* Elo Rating
+* Statistics
+* Achievements
+* Friends List
+* Completed Games
+* Active Games
+
+---
+
+# User Settings
+
+Route:
+
+```text
+/account/settings
+```
+
+Allows:
+
+* Change Email
+* Change Password
+* Toggle Email Notifications
+
+---
+
+# Achievement System
+
+Achievements are automatically unlocked.
+
+Examples:
+
+```text
+First Victory
+5 Games Played
+10 Games Played
+Reach 1400 Elo
+```
+
+Unlocking an achievement creates a notification.
+
+---
+
+# Admin Area
+
+Route:
+
+```text
+/admin
+```
+
+Requires:
+
+```text
+Administrator role
+```
+
+Capabilities:
+
+* View users
+* Disable user account
+* Re-enable user account
+* View active games
+
+---
+
+# Background Services
+
+## InviteCleanupService
+
+Runs hourly.
+
+Responsibilities:
+
+* Expire open games
+* Expire direct invites
+* Generate related notifications
+
+Implemented using:
+
+```text
+BackgroundService
+```
+
+---
+
+# Validation Rules
+
+## Username
+
+Requirements:
+
+```text
+3–20 characters
+letters
+numbers
+underscore
+unique
+```
+
+---
+
+## Friend Requests
+
+Rules:
+
+```text
+Cannot friend yourself
+Cannot send duplicate request
+Cannot friend existing friend
+```
+
+---
+
+## Invites
+
+Rules:
+
+```text
+Cannot invite yourself
+Cannot join your own game
+Cannot create duplicate pending invite
+```
+
+---
+
+# Authorization Rules
+
+Only game participants may:
+
+```text
+Make Move
+Offer Draw
+Withdraw Draw
+Resign
+Request Rematch
+```
+
+Only administrators may:
+
+```text
+Access Admin Area
+Disable Accounts
+```
+
+---
+
+# Logging
+
+Use built-in ASP.NET logging.
+
+Log:
+
+```text
+User Registration
+User Login
+Game Creation
+Game Completion
+Unexpected Exceptions
+```
+
+---
+
+# Error Handling
+
+Custom pages required:
+
+```text
+403 Forbidden
+404 Not Found
+500 Internal Server Error
+```
+
+User-friendly views.
+
+---
+
+# Local Development Setup
+
+## Prerequisites
+
+```text
+.NET 10 SDK
+Docker Desktop
+Node.js
+```
+
+---
+
+## Docker Services
+
+```text
+PostgreSQL
+Mailpit
+```
+
+---
+
+## Startup
+
+```bash
+docker compose up -d
+
+dotnet ef database update
+
+dotnet run
+```
+
+---
+
+# Pages Map
+
+| Route                 | Page          | Auth  |
+| --------------------- | ------------- | ----- |
+| `/`                   | Home          | No    |
+| `/account/login`      | Login         | No    |
+| `/account/register`   | Registration  | No    |
+| `/account/settings`   | Settings      | Yes   |
+| `/lobby`              | Lobby         | Yes   |
+| `/leaderboard`        | Leaderboard   | No    |
+| `/players/{username}` | Profile       | No    |
+| `/games/{id}`         | Game          | Yes   |
+| `/games/{id}/replay`  | Replay        | Yes   |
+| `/friends`            | Friends       | Yes   |
+| `/notifications`      | Notifications | Yes   |
+| `/admin`              | Admin         | Admin |
+
+---
+
+# Definition of Done
+
+A feature is considered complete only when:
+
+* Domain model exists
+* Database migration exists
+* Validation implemented
+* Authorization implemented
+* Business logic implemented
+* UI implemented
+* Logging added where appropriate
+* Feature works end-to-end
+
+---
+
+# Out of Scope (v1)
+
+* Timed games
+* Blitz chess
+* Bullet chess
+* Spectating
+* In-game chat
+* Chess engine analysis
+* Anti-cheat detection
+* Tournament mode
+* Mobile applications
+* Social login
+* Push notifications
+* Elo history charts
+* AI opponents
+
+---
+
+*This specification is a living document and may be amended during implementation as new requirements emerge.*
