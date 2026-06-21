@@ -4,7 +4,8 @@ description: Turn the current conversation into a PRD and publish it to the proj
 disable-model-invocation: true
 ---
 
-This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know.
+This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know. Use the `/create-issue` skill to create an issue item.
+
 
 ## Process
 

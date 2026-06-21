@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # To Issues
 
-Break a plan into independently-grabbable issues using vertical slices (tracer bullets).
+Break a plan into independently-grabbable issues using vertical slices (tracer bullets). Use the `/create-issue` skill to create issue items.
 
 ## Process
 
